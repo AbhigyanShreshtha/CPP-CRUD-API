@@ -30,7 +30,11 @@ private:
         auto self = shared_from_this();
         boost::beast::http::async_read(socket_, buffer_, req_,
             [self](boost::beast::error_code ec, std::size_t) {
-                if (!ec) self->handleRequest();
+                if (!ec) {
+                    self->handleRequest();
+                } else {
+                    std::cerr << "HTTP Read Error: " << ec.message() << std::endl;
+                }
             });
     }
 
@@ -46,6 +50,7 @@ private:
         boost::beast::http::async_write(socket_, res,
             [self](boost::beast::error_code ec, std::size_t) {
                 self->socket_.shutdown(tcp::socket::shutdown_send, ec);
+                if (ec) std::cerr << "HTTP Write Error: " << ec.message() << std::endl;
             });
     }
 };
@@ -56,25 +61,32 @@ class WebSocketSession : public std::enable_shared_from_this<WebSocketSession> {
 
 public:
     WebSocketSession(tcp::socket socket, WebSocketBroadcaster& broadcaster)
-        : ws_(std::move(socket)), broadcaster_(broadcaster) {
-        broadcaster_.addClient(std::make_shared<boost::beast::websocket::stream<tcp::socket>>(std::move(ws_)));
-    }
+        : ws_(std::move(socket)), broadcaster_(broadcaster) {}
 
     void run() {
-        ws_.async_accept([self = shared_from_this()](boost::beast::error_code ec) {
-            if (!ec) self->doRead();
+        auto self = shared_from_this();
+        ws_.async_accept([self](boost::beast::error_code ec) {
+            if (!ec) {
+                self->broadcaster_.addClient(self->ws_);  // Pass ws_ by reference
+                self->doRead();
+            }
         });
     }
 
 private:
     void doRead() {
         auto self = shared_from_this();
-        boost::beast::flat_buffer buffer;
-        ws_.async_read(buffer,
-            [self, buffer = std::move(buffer)](boost::beast::error_code ec, std::size_t) mutable {
-                if (!ec) self->doRead();
+        ws_.async_read(buffer_,
+            [self](boost::beast::error_code ec, std::size_t) {
+                if (!ec) {
+                    self->doRead();  // Continue reading for new messages
+                } else if (ec != boost::beast::websocket::error::closed) {
+                    std::cerr << "WebSocket Read Error: " << ec.message() << std::endl;
+                }
             });
     }
+
+    boost::beast::flat_buffer buffer_;
 };
 
 void startHttpServer(io_context& ioc, CrudController& controller) {
@@ -83,7 +95,11 @@ void startHttpServer(io_context& ioc, CrudController& controller) {
 
     acceptor->async_accept(
         [&ioc, &controller, acceptor](boost::beast::error_code ec, tcp::socket socket) {
-            if (!ec) std::make_shared<HttpSession>(std::move(socket), controller)->run();
+            if (!ec) {
+                std::make_shared<HttpSession>(std::move(socket), controller)->run();
+            } else {
+                std::cerr << "HTTP Accept Error: " << ec.message() << std::endl;
+            }
             startHttpServer(ioc, controller);
         });
 }
@@ -94,7 +110,11 @@ void startWebSocketServer(io_context& ioc, WebSocketBroadcaster& broadcaster) {
 
     acceptor->async_accept(
         [&ioc, &broadcaster, acceptor](boost::beast::error_code ec, tcp::socket socket) {
-            if (!ec) std::make_shared<WebSocketSession>(std::move(socket), broadcaster)->run();
+            if (!ec) {
+                std::make_shared<WebSocketSession>(std::move(socket), broadcaster)->run();
+            } else {
+                std::cerr << "WebSocket Accept Error: " << ec.message() << std::endl;
+            }
             startWebSocketServer(ioc, broadcaster);
         });
 }
@@ -107,11 +127,13 @@ int main() {
         WebSocketBroadcaster broadcaster;
         CrudController controller(service, broadcaster);
 
+        // Start both HTTP and WebSocket servers
         startHttpServer(ioc, controller);
         startWebSocketServer(ioc, broadcaster);
 
         std::cout << "Server running on HTTP port " << HTTP_PORT << " and WebSocket port " << WEBSOCKET_PORT << "\n";
 
+        // Run the IO context to process requests
         ioc.run();
     } catch (std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
